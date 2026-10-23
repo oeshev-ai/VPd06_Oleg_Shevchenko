@@ -1,0 +1,44 @@
+# Секреты
+.env
+.env.local
+.env.*.local
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Тесты и покрытие
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / ОС
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Локальные артефакты Cursor / отладка
+.cursor/
+*.log
+
+# Сгенерированные изображения / дампы
+*.png
+*.jpg
+*.jpeg
+*.webp
+!docs/**
