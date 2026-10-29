@@ -1,0 +1,12 @@
+.venv
+venv
+.env
+.git
+.cursor
+__pycache__
+.pytest_cache
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp

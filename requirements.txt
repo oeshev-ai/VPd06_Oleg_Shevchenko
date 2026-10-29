@@ -1,5 +1,13 @@
 openai
 python-dotenv
 httpx
-pydantic
+pydantic>=2.4,<2.14
 tenacity
+aiogram>=3.31,<4
+redis[hiredis]>=5.0.0,<6
+pytest>=8.0
+pytest-asyncio>=0.24
+fakeredis>=2.26
+respx>=0.22
+ruff>=0.17
+mypy>=1.15

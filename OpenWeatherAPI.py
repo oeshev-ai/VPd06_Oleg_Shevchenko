@@ -4,24 +4,24 @@ Production-ready асинхронный клиент для OpenWeatherMap API.
 
 """
 
-import os
-import sys
-import ssl
-import logging
 import asyncio
+import logging
+import os
+import ssl
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from tenacity import (
     retry,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception,
 )
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -41,6 +41,7 @@ logger = logging.getLogger("OpenWeatherAPI")
 @dataclass
 class OWMConfig:
     """Конфигурация клиента OpenWeatherMap."""
+
     api_key: str = field(default_factory=lambda: os.getenv("OPENWEATHER_API_KEY", ""))
     base_url_weather: str = "https://api.openweathermap.org/data/2.5"
     base_url_geo: str = "https://api.openweathermap.org/geo/1.0"
@@ -57,9 +58,16 @@ class OWMConfig:
 # 2. Исключения
 # ==============================================================================
 
+
 class OpenWeatherAPIError(Exception):
     """Кастомное исключение для ошибок OpenWeatherMap API."""
-    def __init__(self, message: str, status_code: int | None = None, response_json: dict | None = None):
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        response_json: dict | None = None,
+    ):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
@@ -69,6 +77,7 @@ class OpenWeatherAPIError(Exception):
 # ==============================================================================
 # 3. Pydantic Модели Данных
 # ==============================================================================
+
 
 class WeatherCondition(BaseModel):
     description: str = Field(alias="description", default="Неизвестно")
@@ -93,7 +102,7 @@ class CurrentWeather(BaseModel):
             humidity=data.get("humidity", 0),
             wind_speed=data.get("wind_speed", 0.0),
             description=weather_info.get("description", "Неизвестно"),
-            icon=weather_info.get("icon", "")
+            icon=weather_info.get("icon", ""),
         )
 
 
@@ -114,7 +123,7 @@ class DailyForecast(BaseModel):
             temp_day=temp_data.get("day", 0.0),
             temp_night=temp_data.get("night", 0.0),
             description=weather_info.get("description", "Неизвестно"),
-            icon=weather_info.get("icon", "")
+            icon=weather_info.get("icon", ""),
         )
 
 
@@ -130,13 +139,14 @@ class AirPollutionData(BaseModel):
         return cls(
             aqi=main.get("aqi", 1),
             pm2_5=components.get("pm2_5", 0.0),
-            pm10=components.get("pm10", 0.0)
+            pm10=components.get("pm10", 0.0),
         )
 
 
 # ==============================================================================
 # 4. Основной Клиент
 # ==============================================================================
+
 
 def _normalize_current(data: dict) -> dict:
     """Приводит ответ Current Weather 2.5 к полям, которые читает остальной клиент."""
@@ -173,7 +183,11 @@ def _daily_from_forecast(forecast: dict, days: int, timezone_offset: int) -> lis
     for day_key in sorted(buckets)[:days]:
         slots = buckets[day_key]
         day_items = [item for local_dt, item in slots if 9 <= local_dt.hour <= 18]
-        night_items = [item for local_dt, item in slots if local_dt.hour <= 6 or local_dt.hour >= 21]
+        night_items = [
+            item
+            for local_dt, item in slots
+            if local_dt.hour <= 6 or local_dt.hour >= 21
+        ]
         if not day_items:
             day_items = [item for _, item in slots]
         if not night_items:
@@ -181,20 +195,28 @@ def _daily_from_forecast(forecast: dict, days: int, timezone_offset: int) -> lis
 
         representative = min(
             day_items,
-            key=lambda item: abs(datetime.fromtimestamp(item.get("dt", 0), tz).hour - 15),
+            key=lambda item: abs(
+                datetime.fromtimestamp(item.get("dt", 0), tz).hour - 15
+            ),
         )
-        daily.append({
-            "dt": slots[0][1].get("dt", 0),
-            "temp": {
-                "day": max(item.get("main", {}).get("temp", 0.0) for item in day_items),
-                "night": min(item.get("main", {}).get("temp", 0.0) for item in night_items),
-            },
-            "weather": representative.get("weather", []),
-        })
+        daily.append(
+            {
+                "dt": slots[0][1].get("dt", 0),
+                "temp": {
+                    "day": max(
+                        item.get("main", {}).get("temp", 0.0) for item in day_items
+                    ),
+                    "night": min(
+                        item.get("main", {}).get("temp", 0.0) for item in night_items
+                    ),
+                },
+                "weather": representative.get("weather", []),
+            }
+        )
     return daily
 
 
-def is_retryable_exception(e: Exception) -> bool:
+def is_retryable_exception(e: BaseException) -> bool:
     """Определяет, стоит ли повторять запрос при данной ошибке."""
     if isinstance(e, httpx.HTTPStatusError):
         # Повторяем только при 429 (Too Many Requests) и 5xx ошибках сервера
@@ -210,7 +232,7 @@ class OpenWeatherClient:
         self._client = httpx.AsyncClient(
             timeout=self.config.timeout,
             verify=ssl.create_default_context(),
-            headers={"User-Agent": "ProductionWeatherBot/1.0"}
+            headers={"User-Agent": "ProductionWeatherBot/1.0"},
         )
 
     async def close(self):
@@ -229,8 +251,10 @@ class OpenWeatherClient:
         stop=stop_after_attempt(3),
         reraise=True,
         before_sleep=lambda retry_state: logger.warning(
-            f"Попытка {retry_state.attempt_number} не удалась. Повтор через {retry_state.next_action.sleep}с..."
-        )
+            "Попытка %s не удалась. Повтор через %sс...",
+            retry_state.attempt_number,
+            retry_state.next_action.sleep if retry_state.next_action is not None else 0,
+        ),
     )
     async def _make_request(self, url: str, params: dict[str, Any]) -> dict:
         """Внутренний метод для выполнения HTTP-запросов с retry-логикой."""
@@ -244,7 +268,9 @@ class OpenWeatherClient:
             raise OpenWeatherAPIError(
                 message=f"API вернул ошибку {e.response.status_code}",
                 status_code=e.response.status_code,
-                response_json=e.response.json() if e.response.headers.get("content-type") == "application/json" else None
+                response_json=e.response.json()
+                if e.response.headers.get("content-type") == "application/json"
+                else None,
             )
         except httpx.TimeoutException:
             logger.error("Таймаут запроса к %s", url)
@@ -268,17 +294,28 @@ class OpenWeatherClient:
             "units": "metric",
             "lang": "ru",
         }
-        logger.info("Запрос погоды по координатам: lat=%s, lon=%s, forecast=%s", lat, lon, with_forecast)
+        logger.info(
+            "Запрос погоды по координатам: lat=%s, lon=%s, forecast=%s",
+            lat,
+            lon,
+            with_forecast,
+        )
         if not with_forecast:
-            current_raw = await self._make_request(f"{self.config.base_url_weather}/weather", dict(params))
+            current_raw = await self._make_request(
+                f"{self.config.base_url_weather}/weather", dict(params)
+            )
             return _normalize_current(current_raw)
 
         current_raw, forecast_raw = await asyncio.gather(
             self._make_request(f"{self.config.base_url_weather}/weather", dict(params)),
-            self._make_request(f"{self.config.base_url_weather}/forecast", dict(params)),
+            self._make_request(
+                f"{self.config.base_url_weather}/forecast", dict(params)
+            ),
         )
         weather = _normalize_current(current_raw)
-        weather["daily"] = _daily_from_forecast(forecast_raw, min(days, 5), weather["timezone"])
+        weather["daily"] = _daily_from_forecast(
+            forecast_raw, min(days, 5), weather["timezone"]
+        )
         return weather
 
     async def get_weather_by_city(
@@ -305,7 +342,9 @@ class OpenWeatherClient:
             "lang": "ru",
         }
         logger.info("Запрос 3-часового прогноза: lat=%s, lon=%s", lat, lon)
-        raw = await self._make_request(f"{self.config.base_url_weather}/forecast", dict(params))
+        raw = await self._make_request(
+            f"{self.config.base_url_weather}/forecast", dict(params)
+        )
         city = raw.get("city") or {}
         return {
             "lat": float(city.get("coord", {}).get("lat", lat)),
@@ -314,7 +353,9 @@ class OpenWeatherClient:
             "list": list(raw.get("list") or []),
         }
 
-    async def get_forecast_by_city(self, city_name: str, country_code: str | None = None) -> dict:
+    async def get_forecast_by_city(
+        self, city_name: str, country_code: str | None = None
+    ) -> dict:
         """3-часовой прогноз по названию города."""
         location = await self._geocode(city_name, country_code)
         return await self.get_forecast_by_coords(location["lat"], location["lon"])
@@ -343,37 +384,40 @@ class OpenWeatherClient:
             # Запускаем запросы параллельно
             task1 = self.get_weather_by_city(city1, with_forecast=False)
             task2 = self.get_weather_by_city(city2, with_forecast=False)
-            
+
             # Используем return_exceptions=True, чтобы один упавший запрос не отменял другой
             results = await asyncio.gather(task1, task2, return_exceptions=True)
-            
-            comparison = {"city1": city1, "city2": city2, "data": {}}
-            
+
+            data: dict[str, dict[str, Any]] = {}
+            comparison: dict[str, Any] = {"city1": city1, "city2": city2, "data": data}
+
             for i, (city, result) in enumerate(zip([city1, city2], results), start=1):
                 key = f"city{i}"
-                if isinstance(result, Exception):
-                    comparison["data"][key] = {"error": str(result)}
+                if isinstance(result, BaseException):
+                    data[key] = {"error": str(result)}
                 else:
                     current = CurrentWeather.from_owm(result.get("current", {}))
-                    comparison["data"][key] = {
+                    data[key] = {
                         "temp": current.temp,
                         "feels_like": current.feels_like,
                         "description": current.description,
-                        "wind_speed": current.wind_speed
+                        "wind_speed": current.wind_speed,
                     }
             return comparison
         except Exception as e:
             logger.error(f"Ошибка при сравнении городов: {e}")
             raise
 
-    async def format_notification(self, city_name: str, country_code: str | None = None) -> str:
+    async def format_notification(
+        self, city_name: str, country_code: str | None = None
+    ) -> str:
         """Формирование красивой строки уведомления для бота."""
         try:
             weather_data = await self.get_weather_by_city(city_name, country_code)
             current = CurrentWeather.from_owm(weather_data.get("current", {}))
             lat = weather_data.get("lat", 0.0)
             lon = weather_data.get("lon", 0.0)
-            
+
             aqi_text = "Нет данных"
             if lat and lon:
                 try:
@@ -383,19 +427,30 @@ class OpenWeatherClient:
                         aqi_emojis = {1: "🟢", 2: "🟡", 3: "🟠", 4: "🔴", 5: "🟣"}
                         aqi_text = f"{aqi_emojis.get(aqi.aqi, '⚪')} AQI: {aqi.aqi} (PM2.5: {aqi.pm2_5})"
                 except OpenWeatherAPIError as e:
-                    logger.warning(f"Не удалось получить данные о воздухе для {city_name}: {e}")
+                    logger.warning(
+                        f"Не удалось получить данные о воздухе для {city_name}: {e}"
+                    )
 
             # Формируем красивое сообщение
             icon_map = {
-                "01d": "☀️", "01n": "🌙",
-                "02d": "⛅", "02n": "☁️",
-                "03d": "☁️", "03n": "☁️",
-                "04d": "☁️", "04n": "☁️",
-                "09d": "🌧️", "09n": "🌧️",
-                "10d": "🌦️", "10n": "🌧️",
-                "11d": "⛈️", "11n": "⛈️",
-                "13d": "❄️", "13n": "❄️",
-                "50d": "🌫️", "50n": "🌫️",
+                "01d": "☀️",
+                "01n": "🌙",
+                "02d": "⛅",
+                "02n": "☁️",
+                "03d": "☁️",
+                "03n": "☁️",
+                "04d": "☁️",
+                "04n": "☁️",
+                "09d": "🌧️",
+                "09n": "🌧️",
+                "10d": "🌦️",
+                "10n": "🌧️",
+                "11d": "⛈️",
+                "11n": "⛈️",
+                "13d": "❄️",
+                "13n": "❄️",
+                "50d": "🌫️",
+                "50n": "🌫️",
             }
             emoji = icon_map.get(current.icon, "🌡️")
 
@@ -410,27 +465,31 @@ class OpenWeatherClient:
                 f"🕒 Обновлено: {updated_at}"
             )
             return notification
-            
+
         except OpenWeatherAPIError as e:
             return f"❌ Ошибка при получении погоды для '{city_name}': {e.message}"
-        except Exception as e:
-            logger.exception(f"Непредвиденная ошибка при форматировании уведомления для {city_name}")
-            return f"❌ Произошла непредвиденная ошибка при обработке данных."
+        except Exception:
+            logger.exception(
+                "Непредвиденная ошибка при форматировании уведомления для %s",
+                city_name,
+            )
+            return "❌ Произошла непредвиденная ошибка при обработке данных."
 
 
 # ==============================================================================
 # 5. Пример использования (Entry Point)
 # ==============================================================================
 
+
 async def main():
     """Демонстрация работы клиента."""
     # Убедитесь, что в .env файле или в окружении задан OPENWEATHER_API_KEY
     config = OWMConfig()
-    
+
     # Используем контекстный менеджер для автоматического закрытия соединения
     async with OpenWeatherClient(config) as client:
         city = "Москва"
-        
+
         print(f"\n--- 1. Прогноз по городу ({city}) ---")
         try:
             weather = await client.get_weather_by_city(city)
@@ -443,15 +502,21 @@ async def main():
         notification = await client.format_notification(city)
         print(notification)
 
-        print(f"\n--- 3. Сравнение городов (Москва и Санкт-Петербург) ---")
+        print("\n--- 3. Сравнение городов (Москва и Санкт-Петербург) ---")
         try:
             comparison = await client.compare_cities("Москва", "Санкт-Петербург")
-            print(f"Москва: {comparison['data']['city1'].get('temp', 'N/A')}°C, {comparison['data']['city1'].get('description', 'N/A')}")
-            print(f"Санкт-Петербург: {comparison['data']['city2'].get('temp', 'N/A')}°C, {comparison['data']['city2'].get('description', 'N/A')}")
+            print(
+                f"Москва: {comparison['data']['city1'].get('temp', 'N/A')}°C, {comparison['data']['city1'].get('description', 'N/A')}"
+            )
+            print(
+                f"Санкт-Петербург: {comparison['data']['city2'].get('temp', 'N/A')}°C, {comparison['data']['city2'].get('description', 'N/A')}"
+            )
         except OpenWeatherAPIError as e:
             print(f"Ошибка сравнения: {e}")
 
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding="utf-8")
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8")
     asyncio.run(main())

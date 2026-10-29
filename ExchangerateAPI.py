@@ -9,7 +9,6 @@ from dataclasses import dataclass
 
 import httpx
 
-
 # Единственный разрешённый адрес. Другие API и пути не используются.
 CONVERT_URL = "http://api.exchangerate.host/convert"
 
@@ -126,6 +125,8 @@ def _parse_conversion(
         info = {}
     raw_rate = info.get("rate", info.get("quote"))
 
+    if raw_result is None:
+        raise ExchangeServiceError(MSG_SERVICE_UNAVAILABLE)
     try:
         result = float(raw_result)
     except (TypeError, ValueError) as exc:
@@ -172,7 +173,7 @@ async def get_exchange_rate(
     if amount <= 0:
         raise ValueError("Сумма должна быть положительным числом.")
 
-    params = {
+    params: dict[str, str | float] = {
         "access_key": key,
         "from": source,
         "to": target,

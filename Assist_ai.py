@@ -20,7 +20,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from types import TracebackType
+from typing import Any, Literal, Self
 
 import httpx
 from dotenv import load_dotenv
@@ -313,7 +314,7 @@ def _parse_country(raw: Any) -> str | None:
     if raw is None or raw == "":
         return None
     if not isinstance(raw, str):
-        raise ValueError("country_code должен быть строкой, например RU.")
+        raise ValueError("country_code должен быть строкой, например RU.")  # noqa: TRY004
     stripped = raw.strip()
     return stripped or None
 
@@ -348,7 +349,7 @@ def _parse_days(raw: Any) -> int:
     if raw is None:
         return 5
     if isinstance(raw, bool):
-        raise ValueError("days должен быть целым числом от 1 до 5.")
+        raise ValueError("days должен быть целым числом от 1 до 5.")  # noqa: TRY004
     if isinstance(raw, float) and not raw.is_integer():
         raise ValueError("days должен быть целым числом от 1 до 5.")
     try:
@@ -361,7 +362,9 @@ def _parse_days(raw: Any) -> int:
 
 
 def _local_stamp(timestamp: int, timezone_offset: int, with_time: bool) -> str:
-    moment = datetime.fromtimestamp(timestamp, timezone(timedelta(seconds=timezone_offset)))
+    moment = datetime.fromtimestamp(
+        timestamp, timezone(timedelta(seconds=timezone_offset))
+    )
     if with_time:
         return moment.strftime("%Y-%m-%d %H:%M")
     return moment.date().isoformat()
@@ -370,7 +373,9 @@ def _local_stamp(timestamp: int, timezone_offset: int, with_time: bool) -> str:
 def _weather_payload(weather: dict[str, Any], **extra: Any) -> dict[str, Any]:
     """Текущая погода и, если клиент её приложил, суточный прогноз."""
     current_raw = weather.get("current")
-    current = CurrentWeather.from_owm(current_raw if isinstance(current_raw, dict) else {})
+    current = CurrentWeather.from_owm(
+        current_raw if isinstance(current_raw, dict) else {}
+    )
     payload: dict[str, Any] = {
         "latitude": weather.get("lat"),
         "longitude": weather.get("lon"),
@@ -407,13 +412,19 @@ def _forecast_payload(forecast: dict[str, Any], **extra: Any) -> dict[str, Any]:
     for item in forecast.get("list") or []:
         if not isinstance(item, dict):
             continue
-        main = item.get("main") if isinstance(item.get("main"), dict) else {}
-        wind = item.get("wind") if isinstance(item.get("wind"), dict) else {}
-        weather_list = item.get("weather") if isinstance(item.get("weather"), list) else []
-        weather_info = weather_list[0] if weather_list and isinstance(weather_list[0], dict) else {}
+        main_raw = item.get("main")
+        main = main_raw if isinstance(main_raw, dict) else {}
+        wind_raw = item.get("wind")
+        wind = wind_raw if isinstance(wind_raw, dict) else {}
+        weather_raw = item.get("weather")
+        weather_list = weather_raw if isinstance(weather_raw, list) else []
+        first_weather = weather_list[0] if weather_list else None
+        weather_info = first_weather if isinstance(first_weather, dict) else {}
         hours.append(
             {
-                "time_local": _local_stamp(int(item.get("dt") or 0), offset, with_time=True),
+                "time_local": _local_stamp(
+                    int(item.get("dt") or 0), offset, with_time=True
+                ),
                 "temperature": main.get("temp"),
                 "feels_like": main.get("feels_like"),
                 "humidity": main.get("humidity"),
@@ -432,9 +443,15 @@ def _forecast_payload(forecast: dict[str, Any], **extra: Any) -> dict[str, Any]:
 
 def _air_payload(data: dict[str, Any]) -> dict[str, Any]:
     items = data.get("list")
-    first = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+    first = (
+        items[0]
+        if isinstance(items, list) and items and isinstance(items[0], dict)
+        else {}
+    )
     parsed = AirPollutionData.from_owm(first)
-    components = first.get("components") if isinstance(first.get("components"), dict) else {}
+    components = (
+        first.get("components") if isinstance(first.get("components"), dict) else {}
+    )
     return {
         "aqi": parsed.aqi,
         "aqi_scale": "1 — хорошо, 5 — опасно",
@@ -787,7 +804,9 @@ class CompareCitiesTool(_OpenWeatherTool):
 
         async def _load() -> dict[str, Any]:
             comparison = await self._client.compare_cities(city1, city2)
-            return comparison if isinstance(comparison, dict) else {"result": comparison}
+            return (
+                comparison if isinstance(comparison, dict) else {"result": comparison}
+            )
 
         return await self._guard(_load)
 
@@ -827,7 +846,11 @@ class WeatherNotificationTool(_OpenWeatherTool):
 
         async def _load() -> dict[str, Any]:
             text = await self._client.format_notification(city_name, country_code)
-            return {"city_name": city_name, "country_code": country_code, "notification": text}
+            return {
+                "city_name": city_name,
+                "country_code": country_code,
+                "notification": text,
+            }
 
         return await self._guard(_load)
 
@@ -968,7 +991,9 @@ class AssistAIClient:
         if self.config.exchangerate_api_key:
             self.register_tool(ExchangeRateTool(self.config.exchangerate_api_key))
         else:
-            logger.info("EXCHANGERATE_API_KEY не задан, инструмент курса валют отключён")
+            logger.info(
+                "EXCHANGERATE_API_KEY не задан, инструмент курса валют отключён"
+            )
 
     def register_tool(self, tool: BaseTool) -> None:
         """Добавляет инструмент в реестр. Повторное имя заменяет предыдущий инструмент."""
@@ -981,14 +1006,14 @@ class AssistAIClient:
         """Возвращает схемы всех зарегистрированных инструментов для поля ``tools``."""
         return [tool.to_openai_format() for tool in self._tools_registry.values()]
 
-    async def __aenter__(self) -> AssistAIClient:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
-        traceback: Any,
+        traceback: TracebackType | None,
     ) -> None:
         await self.close()
 
@@ -1205,12 +1230,13 @@ class AssistAIClient:
                             tool_builder.add(call)
 
             tool_calls = [
-                self._normalize_tool_call(call)
-                for call in tool_builder.calls()
+                self._normalize_tool_call(call) for call in tool_builder.calls()
             ]
             reasoning_text = "".join(reasoning_parts)
             content_text = "".join(content_parts)
-            wants_tools = (finish_reason == "tool_calls" or bool(tool_calls)) and bool(tool_calls)
+            wants_tools = (finish_reason == "tool_calls" or bool(tool_calls)) and bool(
+                tool_calls
+            )
             if finish_reason == "tool_calls" and not tool_calls:
                 raise AssistAIError(
                     "Модель вернула finish_reason=tool_calls без списка tool_calls."
@@ -1227,7 +1253,9 @@ class AssistAIClient:
                 for call, result in zip(tool_calls, results, strict=True):
                     name = str(call["function"]["name"])
                     arguments = str(call["function"]["arguments"])
-                    preview = arguments if len(arguments) <= 120 else arguments[:117] + "..."
+                    preview = (
+                        arguments if len(arguments) <= 120 else arguments[:117] + "..."
+                    )
                     yield ChatDelta("tool", f"{name} {preview}".rstrip())
                     messages.append(
                         {
@@ -1247,7 +1275,9 @@ class AssistAIClient:
                     )
                 continue
 
-            messages.append(_assistant_stream_message(reasoning_text, content_text, None))
+            messages.append(
+                _assistant_stream_message(reasoning_text, content_text, None)
+            )
             logger.info(
                 "stream_chat: финальный ответ, finish_reason=%s, символов=%s",
                 finish_reason,
@@ -1256,8 +1286,7 @@ class AssistAIClient:
             return
 
         raise AssistAIError(
-            "Превышен лимит вызовов инструментов: "
-            f"{self.config.max_tool_iterations}"
+            f"Превышен лимит вызовов инструментов: {self.config.max_tool_iterations}"
         )
 
     async def generate_image(
@@ -1344,7 +1373,9 @@ class AssistAIClient:
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info("POST %s (stream)", url)
         try:
-            async with self._http.stream("POST", url, json=payload, timeout=timeout) as response:
+            async with self._http.stream(
+                "POST", url, json=payload, timeout=timeout
+            ) as response:
                 await self._raise_for_stream_status(response, _CHAT_PATH)
                 async for line in response.aiter_lines():
                     chunk = _parse_sse_data(line)
@@ -1371,7 +1402,9 @@ class AssistAIClient:
             ) from exc
         except httpx.RequestError as exc:
             logger.error("Сетевая ошибка потока %s: %s", _CHAT_PATH, exc)
-            raise AssistAIError(f"Сетевая ошибка при обращении к ProxyAPI: {exc}") from exc
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+            ) from exc
 
     @staticmethod
     async def _raise_for_stream_status(response: httpx.Response, path: str) -> None:
@@ -1425,10 +1458,14 @@ class AssistAIClient:
             ) from exc
         except httpx.TimeoutException as exc:
             logger.error("Таймаут запроса к %s", path)
-            raise AssistAIError(f"Превышено время ожидания ответа ProxyAPI ({path}).") from exc
+            raise AssistAIError(
+                f"Превышено время ожидания ответа ProxyAPI ({path})."
+            ) from exc
         except httpx.RequestError as exc:
             logger.error("Сетевая ошибка при запросе к %s: %s", path, exc)
-            raise AssistAIError(f"Сетевая ошибка при обращении к ProxyAPI: {exc}") from exc
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+            ) from exc
 
         try:
             data = response.json()
@@ -1530,7 +1567,9 @@ class AssistAIClient:
             arguments = self._parse_tool_arguments(function.get("arguments"))
         except (ValueError, json.JSONDecodeError) as exc:
             logger.error("Не удалось разобрать аргументы %s: %s", name, exc)
-            return _error_json(f"Аргументы инструмента {name} не являются JSON-объектом.")
+            return _error_json(
+                f"Аргументы инструмента {name} не являются JSON-объектом."
+            )
 
         tool = self._tools_registry.get(name)
         if tool is None:
@@ -1565,7 +1604,7 @@ class AssistAIClient:
         if isinstance(raw, str):
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
-                raise ValueError("arguments должны быть JSON-объектом.")
+                raise ValueError("arguments должны быть JSON-объектом.")  # noqa: TRY004
             return parsed
         raise ValueError("Неподдерживаемый тип arguments.")
 
