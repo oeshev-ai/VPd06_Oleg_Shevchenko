@@ -42,3 +42,4 @@ Thumbs.db
 *.jpeg
 *.webp
 !docs/**
+prompt.md

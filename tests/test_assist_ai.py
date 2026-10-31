@@ -9,7 +9,14 @@ import httpx
 import pytest
 from respx import MockRouter
 
-from Assist_ai import AssistAIClient, AssistAIError, BaseTool, _ToolCallBuilder
+from Assist_ai import (
+    AssistAIClient,
+    AssistAIError,
+    BaseTool,
+    ImageModelScope,
+    _ToolCallBuilder,
+)
+from bot import _extract_generated_images
 
 CHAT_URL = "https://api.proxyapi.ru/v1/chat/completions"
 
@@ -281,3 +288,197 @@ async def test_max_tool_iterations_limit(
     assert route.call_count == 5
     assert len(stub.calls) == 5
     assert sum(1 for item in messages if item.get("role") == "tool") == 5
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_packs_url_and_base64(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Инструмент не бросает исключения и помечает url отдельно от base64."""
+    respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"url": "https://cdn.example/cat.png"},
+                    {"b64_json": "aGVsbG8="},
+                ]
+            },
+        )
+    )
+    tool = assist_client._tools_registry["generate_image"]
+
+    with ImageModelScope(None) as scope:
+        payload = json.loads(await tool.execute(prompt="кот в шляпе", size="1024x1024"))
+
+    assert payload["status"] == "success"
+    assert payload["prompt"] == "кот в шляпе"
+    assert payload["image_count"] == 2
+    assert payload["images"] == [{"type": "url"}, {"type": "base64"}]
+    assert "aGVsbG8=" not in json.dumps(payload)
+    assert scope.images == [
+        {"type": "url", "value": "https://cdn.example/cat.png"},
+        {"type": "base64", "value": "aGVsbG8="},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_returns_error_json(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Сбой ProxyAPI остаётся JSON-ошибкой для модели, а не исключением."""
+    respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    tool = assist_client._tools_registry["generate_image"]
+
+    payload = json.loads(await tool.execute(prompt="схема"))
+
+    assert "error" in payload
+    assert "images" not in payload
+
+
+@pytest.mark.asyncio
+async def test_image_model_scope_used_when_tool_omits_model(
+    assist_client: AssistAIClient,
+) -> None:
+    """Модель персоны подставляется, если инструмент вызван без model."""
+    seen: dict[str, str | None] = {}
+
+    async def _fake_generate(
+        prompt: str,
+        model: str | None = None,
+        size: str = "1024x1024",
+    ) -> list[str]:
+        seen["model"] = model
+        seen["prompt"] = prompt
+        return ["https://cdn.example/cat.png"]
+
+    assist_client.generate_image = _fake_generate  # type: ignore[method-assign]
+    tool = assist_client._tools_registry["generate_image"]
+    with ImageModelScope("openai/gpt-image-1.5"):
+        payload = json.loads(await tool.execute(prompt="кот"))
+
+    assert seen["model"] == "openai/gpt-image-1.5"
+    assert payload["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_image_size_scope_used_when_tool_omits_size(
+    assist_client: AssistAIClient,
+) -> None:
+    """Размер персоны подставляется, если инструмент вызван без size."""
+    seen: dict[str, str | None] = {}
+    sizes: list[str] = []
+
+    async def _fake_generate(
+        prompt: str,
+        model: str | None = None,
+        size: str = "1024x1024",
+    ) -> list[str]:
+        sizes.append(size)
+        seen["model"] = model
+        return ["https://cdn.example/cat.png"]
+
+    assist_client.generate_image = _fake_generate  # type: ignore[method-assign]
+    tool = assist_client._tools_registry["generate_image"]
+    with ImageModelScope("black-forest-labs/flux-3-image", "2K"):
+        explicit = json.loads(await tool.execute(prompt="кот", size="1K"))
+        scoped = json.loads(await tool.execute(prompt="кот"))
+
+    assert explicit["status"] == "success"
+    assert scoped["status"] == "success"
+    assert sizes == ["1K", "2K"]
+    assert seen["model"] == "black-forest-labs/flux-3-image"
+
+
+@pytest.mark.asyncio
+async def test_flux_pixel_size_becomes_resolution_tier(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """FLUX не принимает 1024x1024: в запрос уходит ярус 1K."""
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/cat.png"}]}
+        )
+    )
+
+    images = await assist_client.generate_image(
+        "кот",
+        model="black-forest-labs/flux-3-image",
+        size="1024x1024",
+    )
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["size"] == "1K"
+    assert "aspect_ratio" not in body
+    assert images == ["https://cdn.example/cat.png"]
+
+
+@pytest.mark.asyncio
+async def test_openai_image_keeps_pixel_size(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Пиксельный size остаётся у моделей, которым он нужен."""
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/cat.png"}]}
+        )
+    )
+
+    await assist_client.generate_image(
+        "кот",
+        model="openai/gpt-image-1-mini",
+        size="1024x1024",
+    )
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["size"] == "1024x1024"
+    assert "aspect_ratio" not in body
+
+
+def test_extract_generated_images_matches_tool_call_id() -> None:
+    """Бот берёт только картинки вызова generate_image, не чужие tool-сообщения."""
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_img",
+                    "type": "function",
+                    "function": {"name": "generate_image", "arguments": "{}"},
+                },
+                {
+                    "id": "call_fx",
+                    "type": "function",
+                    "function": {"name": "convert_currency", "arguments": "{}"},
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_fx",
+            "content": json.dumps(
+                {"images": [{"type": "url", "value": "https://nope"}]}
+            ),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_img",
+            "content": json.dumps(
+                {
+                    "status": "success",
+                    "images": [{"type": "url", "value": "https://cdn.example/cat.png"}],
+                }
+            ),
+        },
+        {"role": "tool", "tool_call_id": "call_img", "content": "не json"},
+    ]
+
+    assert _extract_generated_images(messages) == [
+        {"type": "url", "value": "https://cdn.example/cat.png"}
+    ]

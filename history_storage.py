@@ -67,9 +67,9 @@ def trim_messages(
 ) -> list[dict[str, Any]]:
     """Оставляет не больше ``max_length`` сообщений, самые новые.
 
-    Системный промпт в начале списка не вытесняется. Если после среза
-    сразу за ним оказывается ``assistant``, эта реплика отбрасывается:
-    у модели не должно быть ответа без вопроса.
+    Системный промпт в начале списка не вытесняется. После среза история
+    выравнивается на ближайший ``user``: иначе посередине tool-раунда
+    остаются сироты ``role: tool`` без ``tool_calls``, и ProxyAPI отвечает 400.
     """
     if max_length < 1:
         raise ValueError("max_length должен быть >= 1.")
@@ -80,10 +80,15 @@ def trim_messages(
     system = dict(messages[0]) if has_system else None
     body = [dict(item) for item in (messages[1:] if has_system else messages)]
     max_body = max_length - (1 if has_system else 0)
+    if max_body < 1:
+        return [system] if system is not None else []
     if len(body) > max_body:
         body = body[-max_body:]
-    while body and body[0].get("role") == "assistant":
-        body = body[1:]
+    start = next(
+        (index for index, item in enumerate(body) if item.get("role") == "user"),
+        None,
+    )
+    body = body[start:] if start is not None else []
     if system is None:
         return body
     return [system, *body]

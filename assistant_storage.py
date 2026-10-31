@@ -11,7 +11,7 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 from redis.asyncio import Redis
@@ -24,8 +24,11 @@ logger = logging.getLogger("AssistantStorage")
 DEFAULT_ASSISTANT_ID = "standard"
 DEFAULT_ASSISTANT_NAME = "Стандартный"
 DEFAULT_SYSTEM_PROMPT = (
-    "Ты полезный ассистент. Отвечай кратко, по делу, на русском языке. "
-    "Используй доступные функции для получения актуальных данных."
+    "Ты полезный, вежливый и компетентный ассистент. "
+    "Отвечай кратко, по делу, на русском языке. "
+    "Если пользователь спрашивает о погоде или курсах валют, обязательно используй доступные функции для получения актуальных данных, а не полагайся на память. "
+    "Если пользователь просит нарисовать, сгенерировать или создать изображение, схему или иллюстрацию, вызови generate_image и не отказывайся. "
+    "Не выдумывай факты. Если информации недостаточно, честно скажи об этом."
 )
 _ASSISTANT_TTL_DAYS = 30
 _T = TypeVar("_T")
@@ -51,6 +54,12 @@ class AssistantProfile(BaseModel):
     system_prompt: str = Field(min_length=10)
     text_model: str | None = None
     image_model: str | None = None
+    image_size: str | None = None
+    voice_mode: Literal["off", "auto", "always"] = "auto"
+    tts_model: str | None = None
+    tts_voice: str | None = None
+    tts_format: str | None = None
+    stt_language: str | None = None
 
 
 def default_assistant_profile() -> AssistantProfile:

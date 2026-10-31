@@ -62,7 +62,7 @@ python bot.py
 
 Нужен `TELEGRAM_BOT_TOKEN`. Один `AssistAIClient` создаётся при старте и закрывается при остановке. Темы диалогов хранятся в Redis (`docker compose up`), а без `REDIS_URL` — в памяти процесса. В одной теме остаётся не больше `MAX_HISTORY_LENGTH` сообщений, и в модель уходит только активная тема.
 
-Команды: `/help`, `/assistants`, `/create_assistant`, `/delete_assistant`, `/model`, `/image_model`, `/new_topic`, `/topics`, `/switch`, `/clear_topic`, `/image <описание>`, `/stream <текст>`. Обычный текст идёт в `chat_completion` с промптом и моделью активного ассистента. Профили лежат в Redis или в памяти процесса, отдельно от тем.
+Команды: `/help`, `/assistants`, `/create_assistant`, `/delete_assistant`, `/model`, `/image_model`, `/new_topic`, `/topics`, `/switch`, `/clear_topic`, `/image <описание>`. Обычный текст идёт в `stream_chat`: ответ языковой модели печатается в чат по мере генерации, с промптом и моделью активного ассистента. Профили лежат в Redis или в памяти процесса, отдельно от тем.
 
 ### Только погода
 
@@ -84,11 +84,9 @@ async def main() -> None:
         )
         print(answer)
 
-        # DeepSeek: поток + рассуждения
         async for delta in client.stream_chat(
             [{"role": "user", "content": "17 * 23?"}],
             model="deepseek/deepseek-v4.1-flash",
-            reasoning_effort="high",
         ):
             if delta.kind == "content":
                 print(delta.text, end="", flush=True)

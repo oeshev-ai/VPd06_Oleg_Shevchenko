@@ -12,11 +12,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,9 +52,13 @@ logger = logging.getLogger("AssistAI")
 
 _CHAT_PATH = "chat/completions"
 _IMAGES_PATH = "images/generations"
-# Генерация картинки и рассуждения модели могут занимать до двух минут.
+_TRANSCRIBE_PATH = "audio/transcriptions"
+_SPEECH_PATH = "audio/speech"
+# Картинка и длинный потоковый ответ могут занимать до двух минут.
 _IMAGE_READ_TIMEOUT = 180.0
 _STREAM_READ_TIMEOUT = 180.0
+_TRANSCRIBE_READ_TIMEOUT = 120.0
+_SPEECH_READ_TIMEOUT = 120.0
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -194,16 +200,16 @@ class _ToolCallBuilder:
         return [self._calls[index] for index in sorted(self._calls)]
 
 
-ChatDeltaKind = Literal["reasoning", "content", "tool"]
+ChatDeltaKind = Literal["content", "tool"]
 
 
 @dataclass(frozen=True)
 class ChatDelta:
     """Фрагмент потокового ответа ``stream_chat``.
 
-    ``reasoning`` — кусок рассуждения модели.
     ``content`` — кусок итогового текста.
     ``tool`` — инструмент уже выполнен, в ``text`` его имя и аргументы.
+    Рассуждения модели в чат не отдаются.
     """
 
     kind: ChatDeltaKind
@@ -229,6 +235,9 @@ class AssistAIConfig(BaseModel):
     ``from_env`` читает ``PROXYAPI_API_KEY``, ``OPENWEATHER_API_KEY``
     и ``EXCHANGERATE_API_KEY``. Пустой ключ погоды или курса валют
     не мешает запустить клиент: соответствующий инструмент просто не регистрируется.
+
+    Голос: ``PROXYAPI_TRANSCRIBE_MODEL``, ``PROXYAPI_TTS_MODEL``,
+    ``PROXYAPI_TTS_VOICE``, ``PROXYAPI_TTS_FORMAT``.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -239,6 +248,10 @@ class AssistAIConfig(BaseModel):
     base_url: str = "https://api.proxyapi.ru/v1"
     default_text_model: str = "openai/gpt-4o"
     default_image_model: str = "openai/gpt-image-1-mini"
+    default_transcribe_model: str = "openai/whisper-1"
+    default_tts_model: str = "openai/gpt-4o-mini-tts"
+    default_tts_voice: str = "alloy"
+    default_tts_format: str = "opus"
     timeout: float = Field(default=30.0, gt=0)
     max_tool_iterations: int = Field(default=5, ge=1)
 
@@ -259,6 +272,12 @@ class AssistAIConfig(BaseModel):
             proxyapi_key=os.getenv("PROXYAPI_API_KEY", ""),
             openweather_api_key=os.getenv("OPENWEATHER_API_KEY", ""),
             exchangerate_api_key=os.getenv("EXCHANGERATE_API_KEY", ""),
+            default_transcribe_model=os.getenv(
+                "PROXYAPI_TRANSCRIBE_MODEL", "openai/whisper-1"
+            ),
+            default_tts_model=os.getenv("PROXYAPI_TTS_MODEL", "openai/gpt-4o-mini-tts"),
+            default_tts_voice=os.getenv("PROXYAPI_TTS_VOICE", "alloy"),
+            default_tts_format=os.getenv("PROXYAPI_TTS_FORMAT", "opus"),
         )
 
 
@@ -948,6 +967,285 @@ class ExchangeRateTool(BaseTool):
         return json.dumps(asdict(conversion), ensure_ascii=False)
 
 
+_REQUEST_IMAGE_MODEL: ContextVar[str | None] = ContextVar(
+    "request_image_model", default=None
+)
+_REQUEST_IMAGE_SIZE: ContextVar[str | None] = ContextVar(
+    "request_image_size", default=None
+)
+_REQUEST_IMAGES: ContextVar[list[dict[str, str]] | None] = ContextVar(
+    "request_generated_images", default=None
+)
+
+# FLUX принимает ярус разрешения, а не пиксели вроде 1024x1024.
+_FLUX_SIZE_TIERS: tuple[tuple[int, str], ...] = (
+    (768, "768"),
+    (1024, "1K"),
+    (1536, "1.5K"),
+    (2048, "2K"),
+    (4096, "4K"),
+)
+_FLUX_TIER_NAMES: dict[str, str] = {name.upper(): name for _, name in _FLUX_SIZE_TIERS}
+_FLUX_ASPECTS: tuple[tuple[int, int], ...] = (
+    (1, 1),
+    (5, 4),
+    (4, 5),
+    (4, 3),
+    (3, 4),
+    (3, 2),
+    (2, 3),
+    (16, 9),
+    (9, 16),
+    (21, 9),
+    (9, 21),
+)
+_PIXEL_SIZE = re.compile(r"(\d+)\s*[xX×]\s*(\d+)")
+
+
+class ImageModelScope:
+    """На время запроса подставляет image-модель персоны и собирает картинки.
+
+    Если модель сама передала ``model`` или ``size``, её значение важнее.
+    Пустая строка означает дефолт клиента. Размер без явного ``size``
+    берётся из персоны, а если его нет — ``1024x1024``.
+    Байты и URL из ``generate_image`` копятся в ``images`` и не уходят
+    обратно в контекст текстовой модели.
+    """
+
+    def __init__(self, model: str | None, size: str | None = None) -> None:
+        self._model = (
+            model.strip() if isinstance(model, str) and model.strip() else None
+        )
+        self._size = size.strip() if isinstance(size, str) and size.strip() else None
+        self.images: list[dict[str, str]] = []
+        self._token: Token[str | None] | None = None
+        self._size_token: Token[str | None] | None = None
+        self._images_token: Token[list[dict[str, str]] | None] | None = None
+
+    def __enter__(self) -> Self:
+        self._token = _REQUEST_IMAGE_MODEL.set(self._model)
+        self._size_token = _REQUEST_IMAGE_SIZE.set(self._size)
+        self._images_token = _REQUEST_IMAGES.set(self.images)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._images_token is not None:
+            _REQUEST_IMAGES.reset(self._images_token)
+        if self._size_token is not None:
+            _REQUEST_IMAGE_SIZE.reset(self._size_token)
+        if self._token is not None:
+            _REQUEST_IMAGE_MODEL.reset(self._token)
+
+
+class GenerateImageTool(BaseTool):
+    """Генерация изображения через ``AssistAIClient.generate_image``.
+
+    Модель вызывает инструмент, когда пользователь просит картинку.
+    Клиент передаётся снаружи: HTTP и выбор модели по умолчанию остаются в нём.
+    """
+
+    def __init__(self, client: AssistAIClient) -> None:
+        self._client = client
+
+    @property
+    def name(self) -> str:
+        return "generate_image"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Сгенерировать изображение по текстовому описанию. "
+            "Вызывай, когда пользователь просит нарисовать, сгенерировать или "
+            "создать изображение, картинку, схему или иллюстрацию. "
+            "Не отвечай, что не умеешь рисовать: используй этот инструмент. "
+            "Если модель генерации не указана, берётся модель по умолчанию клиента."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "Детальное описание изображения на русском или английском."
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Модель генерации, например openai/gpt-image-1-mini. "
+                        "Необязательно."
+                    ),
+                },
+                "size": {
+                    "type": "string",
+                    "description": (
+                        "Размер. Для OpenAI — пиксели, например 1024x1024. "
+                        "Для FLUX пиксели автоматически становятся ярусом "
+                        "768, 1K, 1.5K, 2K или 4K. По умолчанию 1024x1024."
+                    ),
+                },
+            },
+            "required": ["prompt"],
+            "additionalProperties": False,
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        """Генерирует картинку и возвращает короткий JSON для текстовой модели.
+
+        Сами URL и base64 складываются в ``ImageModelScope`` и в ответ модели
+        не попадают: иначе следующий запрос превышает лимит контекста.
+        Ошибки аргументов и ProxyAPI становятся ``{"error": "..."}``.
+        """
+        prompt = kwargs.get("prompt")
+        model = kwargs.get("model")
+        raw_size = kwargs.get("size")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return _error_json(
+                "Параметр prompt обязателен и должен быть непустой строкой."
+            )
+        if model is not None and not isinstance(model, str):
+            return _error_json("Параметр model должен быть строкой.")
+        if raw_size is None:
+            scoped = _REQUEST_IMAGE_SIZE.get()
+            size = scoped if isinstance(scoped, str) and scoped.strip() else "1024x1024"
+        elif not isinstance(raw_size, str) or not raw_size.strip():
+            return _error_json("Параметр size должен быть строкой, например 1024x1024.")
+        else:
+            size = raw_size
+        selected_model = (
+            model.strip() if isinstance(model, str) and model.strip() else None
+        )
+        if selected_model is None:
+            selected_model = _REQUEST_IMAGE_MODEL.get()
+        try:
+            images = await self._client.generate_image(
+                prompt=prompt.strip(),
+                model=selected_model,
+                size=size.strip(),
+            )
+        except AssistAIError as exc:
+            logger.error("generate_image: %s", exc.message)
+            return _error_json(exc.message)
+        except (TypeError, ValueError) as exc:
+            logger.error("generate_image: %s", exc)
+            return _error_json(_exception_text(exc))
+        except Exception as exc:
+            logger.exception("generate_image: непредвиденная ошибка")
+            return _error_json(_exception_text(exc))
+
+        packed = [
+            {
+                "type": "url"
+                if image.startswith(("http://", "https://"))
+                else "base64",
+                "value": image,
+            }
+            for image in images
+        ]
+        bucket = _REQUEST_IMAGES.get()
+        if bucket is None:
+            logger.warning(
+                "generate_image: нет ImageModelScope, картинки некому отдать в чат"
+            )
+        else:
+            bucket.extend(packed)
+        logger.info("generate_image: получено изображений=%s", len(packed))
+        return json.dumps(
+            {
+                "status": "success",
+                "image_count": len(packed),
+                "images": [{"type": item["type"]} for item in packed],
+                "prompt": prompt.strip(),
+                "note": (
+                    "Изображение уже передаётся пользователю в Telegram. "
+                    "Не вставляй base64 и не вызывай инструмент повторно. "
+                    "Кратко подтверди, что картинка готова."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+
+def _is_flux_model(model: str) -> bool:
+    """FLUX не принимает пиксельный ``size`` вроде ``1024x1024``."""
+    lowered = model.lower()
+    return "flux" in lowered or "black-forest" in lowered
+
+
+def _snap_aspect_ratio(width: int, height: int) -> str:
+    """Ближайшее соотношение сторон из набора, который понимает FLUX."""
+    if width <= 0 or height <= 0:
+        return "1:1"
+    target = width / height
+    numer, denom = min(
+        _FLUX_ASPECTS,
+        key=lambda item: abs((item[0] / item[1]) - target),
+    )
+    return f"{numer}:{denom}"
+
+
+def _image_generation_body(model: str, prompt: str, size: str) -> dict[str, Any]:
+    """Тело ``images/generations``. Для FLUX пиксели становятся ярусом разрешения."""
+    fields: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1}
+    cleaned = size.strip()
+    if not _is_flux_model(model):
+        fields["size"] = cleaned
+        return fields
+    known = _FLUX_TIER_NAMES.get(cleaned.upper())
+    if known is not None:
+        fields["size"] = known
+        return fields
+    match = _PIXEL_SIZE.fullmatch(cleaned)
+    if match is None:
+        fields["size"] = cleaned
+        return fields
+    width = int(match.group(1))
+    height = int(match.group(2))
+    long_side = max(width, height)
+    tier = min(
+        _FLUX_SIZE_TIERS,
+        key=lambda item: (abs(item[0] - long_side), item[0]),
+    )[1]
+    fields["size"] = tier
+    ratio = _snap_aspect_ratio(width, height)
+    if ratio != "1:1":
+        fields["aspect_ratio"] = ratio
+    return fields
+
+
+@dataclass(frozen=True)
+class SpeechResult:
+    """Готовый аудиоответ TTS: байты, имя файла и MIME."""
+
+    audio: bytes
+    filename: str
+    mime_type: str
+
+
+def _audio_mime(filename: str) -> str:
+    """MIME по расширению аудиофайла для multipart STT."""
+    lowered = filename.rsplit(".", 1)[-1].casefold() if "." in filename else ""
+    return {
+        "ogg": "audio/ogg",
+        "oga": "audio/ogg",
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "m4a": "audio/mp4",
+        "webm": "audio/webm",
+    }.get(lowered, "application/octet-stream")
+
+
+def _speech_file(response_format: str) -> tuple[str, str]:
+    """Имя файла и MIME для ответа TTS."""
+    fmt = response_format.strip().casefold()
+    if fmt == "mp3":
+        return "answer.mp3", "audio/mpeg"
+    return "answer.ogg", "audio/ogg"
+
+
 class AssistAIClient:
     """Единый асинхронный клиент ProxyAPI: чат с инструментами и картинки.
 
@@ -994,6 +1292,7 @@ class AssistAIClient:
             logger.info(
                 "EXCHANGERATE_API_KEY не задан, инструмент курса валют отключён"
             )
+        self.register_tool(GenerateImageTool(self))
 
     def register_tool(self, tool: BaseTool) -> None:
         """Добавляет инструмент в реестр. Повторное имя заменяет предыдущий инструмент."""
@@ -1137,31 +1436,25 @@ class AssistAIClient:
         self,
         messages: list[dict[str, Any]],
         model: str | None = None,
-        *,
-        reasoning_effort: str | None = None,
     ) -> AsyncIterator[ChatDelta]:
         """Потоковый диалог с теми же инструментами, что и ``chat_completion``.
 
-        В запрос добавляется ``stream: true``. Если передан ``reasoning_effort``,
-        он уходит в каждом круге — ProxyAPI включает им рассуждения модели.
-        Фрагменты рассуждения приходят как ``ChatDelta(kind="reasoning")``,
-        текст ответа — как ``kind="content"``. Оба нужно склеивать по порядку.
+        В запрос добавляется ``stream: true``. Наружу выходят только текст
+        ответа и отметки об инструментах. Куски рассуждения в поток не попадают.
 
-        Вызовы инструментов по потоку собираются из ``delta.tool_calls`` и
-        выполняются после закрытия потока. Для DeepSeek в историю кладётся
-        ``reasoning_content``: при включённых tools его нужно возвращать
-        в следующих запросах, иначе сервис отвечает 400.
+        Вызовы инструментов собираются из ``delta.tool_calls`` и выполняются
+        после закрытия потока. Для DeepSeek рассуждение сохраняется в истории
+        запроса как ``reasoning_content``: при включённых tools его нужно
+        вернуть в следующем круге, иначе сервис отвечает 400.
 
         Таймаут чтения не короче 180 секунд. Соединение ограничено ``config.timeout``.
 
         Args:
             messages: История диалога. Метод дополняет её на месте.
             model: Модель ProxyAPI. По умолчанию ``default_text_model``.
-            reasoning_effort: Уровень рассуждений, например ``high``.
-                Пустое значение параметр в запрос не добавляет.
 
         Yields:
-            Фрагменты рассуждения, ответа и отметки о выполненных инструментах.
+            Фрагменты ответа и отметки о выполненных инструментах.
 
         Raises:
             ValueError: Список сообщений пуст.
@@ -1172,7 +1465,6 @@ class AssistAIClient:
 
         selected_model = model or self.config.default_text_model
         tools = self.get_tools_schema()
-        effort = reasoning_effort.strip() if isinstance(reasoning_effort, str) else ""
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
             payload: dict[str, Any] = {
@@ -1180,16 +1472,13 @@ class AssistAIClient:
                 "messages": messages,
                 "stream": True,
             }
-            if effort:
-                payload["reasoning_effort"] = effort
             if tools:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
 
             logger.info(
-                "stream_chat: модель=%s, reasoning_effort=%s, итерация=%s/%s, сообщений=%s",
+                "stream_chat: модель=%s, итерация=%s/%s, сообщений=%s",
                 selected_model,
-                effort or "-",
                 iteration,
                 self.config.max_tool_iterations,
                 len(messages),
@@ -1216,7 +1505,6 @@ class AssistAIClient:
                 reasoning = _reasoning_piece(delta)
                 if reasoning:
                     reasoning_parts.append(reasoning)
-                    yield ChatDelta("reasoning", reasoning)
 
                 content = delta.get("content")
                 if isinstance(content, str) and content:
@@ -1308,7 +1596,8 @@ class AssistAIClient:
         Args:
             prompt: Текстовое описание изображения.
             model: Модель генерации. По умолчанию ``default_image_model``.
-            size: Размер, например ``1024x1024``.
+            size: Размер. Для OpenAI — пиксели, например ``1024x1024``.
+                Для FLUX пиксели переводятся в ярус ``1K`` и соседние.
 
         Returns:
             Список URL или base64-строк, по одному элементу на картинку.
@@ -1323,18 +1612,13 @@ class AssistAIClient:
             raise ValueError("size не может быть пустым.")
 
         selected_model = model or self.config.default_image_model
-        payload: dict[str, Any] = {
-            "model": selected_model,
-            "prompt": prompt,
-            "size": size,
-            "n": 1,
-        }
+        payload = _image_generation_body(selected_model, prompt, size.strip())
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
             "generate_image: модель=%s, size=%s, символов в prompt=%s",
             selected_model,
-            size,
+            payload.get("size"),
             len(prompt),
         )
         data = await self._post_json(_IMAGES_PATH, payload, timeout=timeout)
@@ -1359,6 +1643,178 @@ class AssistAIClient:
 
         logger.info("generate_image: получено изображений: %s", len(images))
         return images
+
+    async def transcribe_audio(
+        self,
+        audio_bytes: bytes,
+        filename: str = "voice.ogg",
+        model: str | None = None,
+        language: str | None = None,
+    ) -> str:
+        """Распознаёт речь через ProxyAPI ``/audio/transcriptions``.
+
+        Args:
+            audio_bytes: байты аудиофайла.
+            filename: имя файла с расширением. Telegram voice обычно OGG/Opus.
+            model: модель распознавания. Если None — ``default_transcribe_model``.
+            language: язык речи, например ``ru``. Если None — автоопределение.
+
+        Returns:
+            Распознанный текст. Если речи нет — пустая строка.
+
+        Raises:
+            ValueError: если ``audio_bytes`` пустой.
+            AssistAIError: ошибка HTTP, таймаут, некорректный ответ ProxyAPI.
+        """
+        if not audio_bytes:
+            raise ValueError("audio_bytes не может быть пустым.")
+        if self._closed:
+            raise AssistAIError("Клиент уже закрыт.")
+
+        selected_model = model or self.config.default_transcribe_model
+        url = f"{self.config.base_url.rstrip('/')}/{_TRANSCRIBE_PATH}"
+        form: dict[str, str] = {"model": selected_model}
+        if language:
+            form["language"] = language
+        mime_type = _audio_mime(filename)
+        files = {"file": (filename, audio_bytes, mime_type)}
+        # Базовый клиент шлёт Content-Type: application/json. Для multipart
+        # нужен отдельный клиент без этого заголовка, иначе boundary пропадёт.
+        read_timeout = max(self.config.timeout, _TRANSCRIBE_READ_TIMEOUT)
+        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+        logger.info(
+            "transcribe_audio: модель=%s, байт=%s, язык=%s",
+            selected_model,
+            len(audio_bytes),
+            language or "auto",
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                verify=_ssl_context(),
+                headers={
+                    "Authorization": f"Bearer {self.config.proxyapi_key}",
+                    "User-Agent": "AssistAIClient/1.0",
+                },
+            ) as client:
+                response = await client.post(url, data=form, files=files)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_text(exc.response)
+            logger.error(
+                "ProxyAPI HTTP %s для %s: %s",
+                exc.response.status_code,
+                _TRANSCRIBE_PATH,
+                detail,
+            )
+            raise AssistAIError(
+                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.error("Таймаут запроса к %s", _TRANSCRIBE_PATH)
+            raise AssistAIError(
+                f"Превышено время ожидания ответа ProxyAPI ({_TRANSCRIBE_PATH})."
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error("Сетевая ошибка при запросе к %s: %s", _TRANSCRIBE_PATH, exc)
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+            ) from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            logger.error("ProxyAPI вернул не-JSON для %s", _TRANSCRIBE_PATH)
+            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
+        if not isinstance(data, dict):
+            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
+        text = data.get("text")
+        if not isinstance(text, str):
+            return ""
+        recognized = text.strip()
+        logger.info("transcribe_audio: символов=%s", len(recognized))
+        return recognized
+
+    async def synthesize_speech(
+        self,
+        text: str,
+        model: str | None = None,
+        voice: str | None = None,
+        response_format: str | None = None,
+    ) -> SpeechResult:
+        """Синтезирует речь через ProxyAPI ``/audio/speech``.
+
+        Args:
+            text: текст ответа ассистента.
+            model: TTS-модель.
+            voice: голос.
+            response_format: формат аудио. По умолчанию opus.
+
+        Returns:
+            SpeechResult с байтами аудио, filename и mime_type.
+
+        Raises:
+            ValueError: пустой текст.
+            AssistAIError: ошибка HTTP, таймаут или пустой аудиоответ.
+        """
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text не может быть пустым.")
+        if self._closed:
+            raise AssistAIError("Клиент уже закрыт.")
+
+        selected_model = model or self.config.default_tts_model
+        selected_voice = voice or self.config.default_tts_voice
+        selected_format = response_format or self.config.default_tts_format
+        payload = {
+            "model": selected_model,
+            "input": text,
+            "voice": selected_voice,
+            "response_format": selected_format,
+        }
+        url = f"{self.config.base_url.rstrip('/')}/{_SPEECH_PATH}"
+        read_timeout = max(self.config.timeout, _SPEECH_READ_TIMEOUT)
+        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+        logger.info(
+            "synthesize_speech: модель=%s, голос=%s, формат=%s, символов=%s",
+            selected_model,
+            selected_voice,
+            selected_format,
+            len(text),
+        )
+        try:
+            response = await self._http.post(url, json=payload, timeout=timeout)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_text(exc.response)
+            logger.error(
+                "ProxyAPI HTTP %s для %s: %s",
+                exc.response.status_code,
+                _SPEECH_PATH,
+                detail,
+            )
+            raise AssistAIError(
+                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.error("Таймаут запроса к %s", _SPEECH_PATH)
+            raise AssistAIError(
+                f"Превышено время ожидания ответа ProxyAPI ({_SPEECH_PATH})."
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error("Сетевая ошибка при запросе к %s: %s", _SPEECH_PATH, exc)
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+            ) from exc
+
+        audio = response.content
+        if not audio:
+            raise AssistAIError("ProxyAPI вернул пустой аудиоответ.")
+        filename, mime_type = _speech_file(selected_format)
+        logger.info("synthesize_speech: байт=%s", len(audio))
+        return SpeechResult(audio=audio, filename=filename, mime_type=mime_type)
 
     async def _iter_chat_chunks(
         self,
